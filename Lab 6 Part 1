@@ -1,0 +1,418 @@
+#!/usr/bin/env python3
+"""
+ECEN 432 – LAB 6, Part 1
+4-stage Pipelined ADC (2b/stage, no redundancy)
+Calibration automation with 5 algorithms:
+  1) Direct Iterative (coordinate-descent on knobs)
+  2) LMS (gradient-descent / Least-Mean-Squared)
+  3) CPS + Parallel Thompson Sampling
+  4) Reinforcement Learning (Q-learning on knobs)
+  5) Agentic AI (multi-agent cooperative calibration)
+
+Conventions: bin-aligned FFT at bin C=113, np.random.seed,
+             one-sided PSD via 1/(Fs*L), plt.show()
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ============================================================
+# Global parameters
+# ============================================================
+np.random.seed(42)
+
+N_STAGES   = 4
+BITS_STAGE = 2
+N_BITS     = N_STAGES * BITS_STAGE  # 8-bit overall
+
+Vref       = 1.0
+Fs         = 1e6
+L          = 4096
+C          = 113
+Fin        = C * Fs / L
+A_in       = Vref * 0.95
+
+L_CAL      = 512       # shorter signal for calibration speed
+C_CAL      = 29        # coherent bin for calibration signal
+
+N_MC       = 100
+N_ITER_CAL = 100
+N_MC_CAL   = 10
+
+OFFSET_STD = 0.030
+GAIN_STD   = 0.030
+
+# ============================================================
+# Vectorized Pipeline ADC model (2b/stage, no redundancy)
+# ============================================================
+class PipelinedADC:
+    def __init__(self, Vref=1.0, n_stages=4):
+        self.Vref = Vref
+        self.n_stages = n_stages
+        self.bits_per_stage = 2
+        self.ideal_gain = 4
+        self.ideal_thresholds = np.array([-Vref/2, 0.0, Vref/2])
+        self.comp_offsets = [np.zeros(3) for _ in range(n_stages)]
+        self.gain_errors  = np.zeros(n_stages)
+        self.offset_knobs = [np.zeros(3) for _ in range(n_stages)]
+        self.gain_knobs   = np.zeros(n_stages)
+
+    def set_impairments(self, offset_std, gain_std):
+        for s in range(self.n_stages):
+            self.comp_offsets[s] = np.random.randn(3) * offset_std
+        self.gain_errors = np.random.randn(self.n_stages) * gain_std
+
+    def reset_knobs(self):
+        self.offset_knobs = [np.zeros(3) for _ in range(self.n_stages)]
+        self.gain_knobs   = np.zeros(self.n_stages)
+
+    def convert(self, x):
+        v = x.copy()
+        all_codes = np.zeros((self.n_stages, len(x)), dtype=int)
+        for s in range(self.n_stages):
+            th = self.ideal_thresholds + self.comp_offsets[s] + self.offset_knobs[s]
+            code = ((v > th[0]).astype(int) + (v > th[1]).astype(int)
+                    + (v > th[2]).astype(int))
+            all_codes[s] = code
+            vdac = (code - 1.5) * (self.Vref / 2)
+            if s < self.n_stages - 1:
+                gain = self.ideal_gain * (1.0 + self.gain_errors[s] + self.gain_knobs[s])
+                v = gain * (v - vdac)
+        digital = np.zeros(len(x), dtype=int)
+        for s in range(self.n_stages):
+            digital += all_codes[s] * (self.ideal_gain ** (self.n_stages - 1 - s))
+        return digital
+
+    def convert_to_analog(self, x):
+        codes = self.convert(x)
+        n_levels = self.ideal_gain ** self.n_stages
+        return (codes / (n_levels - 1)) * 2 * self.Vref - self.Vref
+
+    def get_all_knobs(self):
+        knobs = []
+        for s in range(self.n_stages):
+            knobs.extend(self.offset_knobs[s].tolist())
+        knobs.extend(self.gain_knobs.tolist())
+        return np.array(knobs)
+
+    def set_all_knobs(self, kv):
+        idx = 0
+        for s in range(self.n_stages):
+            self.offset_knobs[s] = kv[idx:idx+3].copy()
+            idx += 3
+        self.gain_knobs = kv[idx:idx+self.n_stages].copy()
+
+    @property
+    def n_knobs(self):
+        return 3 * self.n_stages + self.n_stages  # 16
+
+# ============================================================
+# Helpers
+# ============================================================
+def gen_sin(L, A, C, Fs):
+    n = np.arange(L)
+    return A * np.sin(2 * np.pi * C * n / L)
+
+def compute_sndr(x, C, L, n_sig_bins=7):
+    """Compute SNDR using Hanning window, summing signal power over
+    n_sig_bins centered on bin C to account for window spreading."""
+    w = np.hanning(L)
+    X = np.fft.fft(x * w)
+    Pxx = np.abs(X[:L//2])**2
+    half = n_sig_bins // 2
+    lo = max(1, C - half)
+    hi = min(L//2, C + half + 1)
+    sig_power = np.sum(Pxx[lo:hi])
+    nd_power = np.sum(Pxx[1:L//2]) - sig_power
+    if nd_power <= 0:
+        return 80.0
+    return 10 * np.log10(sig_power / nd_power)
+
+def eval_mse(adc, x):
+    y = adc.convert_to_analog(x)
+    return np.mean((y - x)**2)
+
+def eval_sndr(adc, x, C, L):
+    y = adc.convert_to_analog(x)
+    return compute_sndr(y, C, L)
+
+x_test = gen_sin(L, A_in, C, Fs)
+x_cal  = gen_sin(L_CAL, A_in, C_CAL, Fs)
+
+# ============================================================
+# Section 1: Ideal ADC
+# ============================================================
+print("=" * 60)
+print("Section 1: Ideal 4-stage 2b/stage Pipeline ADC")
+print("=" * 60)
+
+adc_ideal = PipelinedADC(Vref=Vref)
+y_ideal = adc_ideal.convert_to_analog(x_test)
+sndr_ideal = compute_sndr(y_ideal, C, L)
+enob_ideal = (sndr_ideal - 1.76) / 6.02
+print(f"Ideal SNDR = {sndr_ideal:.2f} dB,  ENOB = {enob_ideal:.2f} bits")
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+axes[0].plot(x_test[:200], label='Input')
+axes[0].plot(y_ideal[:200], label='ADC output', alpha=0.8)
+axes[0].set_title('Ideal ADC: Time Domain (first 200 samples)')
+axes[0].set_xlabel('Sample'); axes[0].set_ylabel('Amplitude (V)')
+axes[0].legend(); axes[0].grid(True)
+
+Y = np.fft.fft(y_ideal * np.hanning(L))
+Pxx = np.abs(Y[:L//2])**2 / (Fs * L)
+freqs = np.arange(L//2) * Fs / L
+axes[1].plot(freqs/1e3, 10*np.log10(Pxx + 1e-20))
+axes[1].set_title(f'Ideal ADC: PSD  (SNDR={sndr_ideal:.1f} dB, ENOB={enob_ideal:.1f})')
+axes[1].set_xlabel('Frequency (kHz)'); axes[1].set_ylabel('PSD (dB)')
+axes[1].grid(True)
+plt.tight_layout()
+plt.savefig('fig1_ideal_adc.png', dpi=150)
+plt.show()
+print("  -> Saved fig1_ideal_adc.png")
+
+# ============================================================
+# Section 2: ADC with impairments – 100 MC runs
+# ============================================================
+print("\n" + "=" * 60)
+print("Section 2: ADC with impairments (100 MC runs)")
+print("=" * 60)
+
+sndr_impaired_list = []
+for mc in range(N_MC):
+    adc = PipelinedADC(Vref=Vref)
+    np.random.seed(1000 + mc)
+    adc.set_impairments(OFFSET_STD, GAIN_STD)
+    sndr_impaired_list.append(eval_sndr(adc, x_test, C, L))
+
+sndr_impaired_avg = np.mean(sndr_impaired_list)
+sndr_impaired_std = np.std(sndr_impaired_list)
+print(f"Average SNDR (impaired) = {sndr_impaired_avg:.2f} +/- {sndr_impaired_std:.2f} dB")
+
+fig, ax = plt.subplots(figsize=(8, 5))
+ax.hist(sndr_impaired_list, bins=20, edgecolor='black', alpha=0.7)
+ax.axvline(sndr_impaired_avg, color='r', linestyle='--',
+           label=f'Mean={sndr_impaired_avg:.1f} dB')
+ax.axvline(sndr_ideal, color='g', linestyle='--',
+           label=f'Ideal={sndr_ideal:.1f} dB')
+ax.set_title('SNDR Distribution (100 MC, sigma_off=30mV, sigma_gain=30mV/V)')
+ax.set_xlabel('SNDR (dB)'); ax.set_ylabel('Count')
+ax.legend(); ax.grid(True)
+plt.tight_layout()
+plt.savefig('fig2_impaired_histogram.png', dpi=150)
+plt.show()
+print("  -> Saved fig2_impaired_histogram.png")
+
+# ============================================================
+# Section 3: Calibration Algorithms
+# ============================================================
+print("\n" + "=" * 60)
+print("Section 3: Calibration (5 algorithms)")
+print("=" * 60)
+
+def calibrate_direct(adc, x, n_iter, C_sig, L_sig):
+    sndr_hist = []; delta = 0.02; nk = adc.n_knobs
+    for it in range(n_iter):
+        knobs = adc.get_all_knobs()
+        for k in range(nk):
+            best_mse = eval_mse(adc, x); best_val = knobs[k]
+            for d in [-1, 1]:
+                kk = knobs.copy(); kk[k] = best_val + d * delta
+                adc.set_all_knobs(kk)
+                m = eval_mse(adc, x)
+                if m < best_mse: best_mse = m; best_val = kk[k]
+            knobs[k] = best_val; adc.set_all_knobs(knobs)
+        sndr_hist.append(eval_sndr(adc, x, C_sig, L_sig))
+        if (it+1) % 15 == 0: delta *= 0.75
+    return sndr_hist
+
+def calibrate_lms(adc, x, n_iter, C_sig, L_sig):
+    """
+    LMS-style calibration using sign-gradient descent with larger
+    perturbations to handle quantized MSE landscape.
+    """
+    sndr_hist = []; step = 0.01; eps = 0.005; nk = adc.n_knobs
+    for it in range(n_iter):
+        knobs = adc.get_all_knobs()
+        # Central difference with large eps to cross quantization boundaries
+        grad = np.zeros(nk)
+        for k in range(nk):
+            kp = knobs.copy(); kp[k] += eps
+            km = knobs.copy(); km[k] -= eps
+            adc.set_all_knobs(kp); mp = eval_mse(adc, x)
+            adc.set_all_knobs(km); mm = eval_mse(adc, x)
+            grad[k] = (mp - mm) / (2 * eps)
+        # Sign-gradient update (robust to scale issues)
+        adc.set_all_knobs(knobs)
+        mse_base = eval_mse(adc, x)
+        new_knobs = knobs - step * np.sign(grad)
+        adc.set_all_knobs(new_knobs)
+        mse_new = eval_mse(adc, x)
+        if mse_new >= mse_base:
+            adc.set_all_knobs(knobs)  # revert
+        sndr_hist.append(eval_sndr(adc, x, C_sig, L_sig))
+        if (it+1) % 15 == 0: step *= 0.8
+    return sndr_hist
+
+def calibrate_cps_pts(adc, x, n_iter, C_sig, L_sig):
+    sndr_hist = []; nk = adc.n_knobs
+    M = 7; Ns = 3; I_trans = 15; gamma_c = 0.5
+    centroids = np.linspace(-0.15, 0.15, M)
+    ab = np.ones((nk, M, 2))
+    for it in range(n_iter):
+        knobs = adc.get_all_knobs()
+        eta = 1.0 if it < I_trans else max(0.01, 1.0/(gamma_c*(it-I_trans+1)))
+        for k in range(nk):
+            samps = np.array([np.random.beta(ab[k,m,0], ab[k,m,1]) for m in range(M)])
+            subset = np.argsort(samps)[-Ns:]
+            best_mse = np.inf; best_m = subset[0]; best_v = knobs[k]
+            for m in subset:
+                cv = knobs[k] + eta * (centroids[m] - knobs[k])
+                kk = knobs.copy(); kk[k] = cv; adc.set_all_knobs(kk)
+                mm = eval_mse(adc, x)
+                if mm < best_mse: best_mse = mm; best_m = m; best_v = cv
+            knobs[k] = best_v; adc.set_all_knobs(knobs)
+            for m in subset:
+                if m == best_m: ab[k,m,0] += 1
+                else: ab[k,m,1] += 1
+        sndr_hist.append(eval_sndr(adc, x, C_sig, L_sig))
+    return sndr_hist
+
+def calibrate_rl(adc, x, n_iter, C_sig, L_sig):
+    """Q-learning with per-knob sequential updates and individual rewards."""
+    sndr_hist = []; nk = adc.n_knobs
+    step = 0.01; lr_q = 0.2; gamma_q = 0.9; epsilon = 0.4
+    Q = np.zeros((nk, 3))  # actions: decrease, hold, increase
+    for it in range(n_iter):
+        knobs = adc.get_all_knobs()
+        for k in range(nk):
+            mse_before = eval_mse(adc, x)
+            if np.random.rand() < epsilon:
+                a = np.random.randint(3)
+            else:
+                a = np.argmax(Q[k])
+            knobs_try = knobs.copy()
+            knobs_try[k] += (a - 1) * step
+            adc.set_all_knobs(knobs_try)
+            mse_after = eval_mse(adc, x)
+            reward = (mse_before - mse_after) * 1e4  # scale reward
+            if mse_after < mse_before:
+                knobs = knobs_try  # keep improvement
+            else:
+                adc.set_all_knobs(knobs)  # revert
+                reward = -0.1  # small penalty
+            Q[k, a] += lr_q * (reward + gamma_q * np.max(Q[k]) - Q[k, a])
+        sndr_hist.append(eval_sndr(adc, x, C_sig, L_sig))
+        epsilon = max(0.05, epsilon * 0.97)
+        if (it+1) % 20 == 0: step *= 0.8
+    return sndr_hist
+
+def calibrate_agentic(adc, x, n_iter, C_sig, L_sig):
+    """
+    Multi-agent calibration with coordinator:
+      Agent 1: offset knobs stages 0-1 (idx 0-5)
+      Agent 2: offset knobs stages 2-3 (idx 6-11)
+      Agent 3: gain knobs all stages   (idx 12-15)
+    Each agent does sign-gradient descent on its own knobs.
+    Coordinator schedules which agent acts each iteration (round-robin
+    with occasional joint updates).
+    """
+    sndr_hist = []; eps_fd = 0.005
+    agents = [
+        {'idx': list(range(0, 6)),  'step': 0.012, 'name': 'off01'},
+        {'idx': list(range(6, 12)), 'step': 0.012, 'name': 'off23'},
+        {'idx': list(range(12,16)), 'step': 0.010, 'name': 'gain'},
+    ]
+    for it in range(n_iter):
+        # Coordinator: all agents act every iteration (parallel-style)
+        for ag in agents:
+            knobs = adc.get_all_knobs()
+            mse0 = eval_mse(adc, x)
+            grad = np.zeros(len(ag['idx']))
+            for j, k in enumerate(ag['idx']):
+                kp = knobs.copy(); kp[k] += eps_fd
+                km = knobs.copy(); km[k] -= eps_fd
+                adc.set_all_knobs(kp); mp = eval_mse(adc, x)
+                adc.set_all_knobs(km); mm = eval_mse(adc, x)
+                grad[j] = (mp - mm) / (2 * eps_fd)
+            # Sign-gradient update
+            new_knobs = knobs.copy()
+            for j, k in enumerate(ag['idx']):
+                new_knobs[k] -= ag['step'] * np.sign(grad[j])
+            adc.set_all_knobs(new_knobs)
+            mse_new = eval_mse(adc, x)
+            if mse_new >= mse0:
+                adc.set_all_knobs(knobs)  # revert
+        sndr_hist.append(eval_sndr(adc, x, C_sig, L_sig))
+        if (it+1) % 15 == 0:
+            for ag in agents: ag['step'] *= 0.8
+    return sndr_hist
+
+# ============================================================
+# Run all calibration algorithms
+# ============================================================
+algorithms = {
+    'Direct Iterative':  calibrate_direct,
+    'LMS (Gradient)':    calibrate_lms,
+    'CPS + PTS':         calibrate_cps_pts,
+    'RL (Q-Learning)':   calibrate_rl,
+    'Agentic AI':        calibrate_agentic,
+}
+
+results = {name: np.zeros(N_ITER_CAL) for name in algorithms}
+
+for mc in range(N_MC_CAL):
+    print(f"\r  MC run {mc+1}/{N_MC_CAL}", end='', flush=True)
+    for alg_name, alg_func in algorithms.items():
+        np.random.seed(2000 + mc)
+        adc = PipelinedADC(Vref=Vref)
+        adc.set_impairments(OFFSET_STD, GAIN_STD)
+        adc.reset_knobs()
+        np.random.seed(5000 + mc * 100 + hash(alg_name) % 1000)
+        sndr_hist = alg_func(adc, x_cal, N_ITER_CAL, C_CAL, L_CAL)
+        results[alg_name] += np.array(sndr_hist)
+
+for name in results:
+    results[name] /= N_MC_CAL
+
+print("\n  Calibration complete.")
+
+# ============================================================
+# Section 4: Comparison Plot
+# ============================================================
+fig, ax = plt.subplots(figsize=(12, 7))
+colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd']
+styles = ['-', '--', '-.', ':', '-']
+markers = ['o', 's', '^', 'D', 'v']
+
+for i, (name, sndr_arr) in enumerate(results.items()):
+    iters = np.arange(1, N_ITER_CAL + 1)
+    ax.plot(iters, sndr_arr, color=colors[i], linestyle=styles[i],
+            marker=markers[i], markevery=10, markersize=6,
+            linewidth=2, label=name)
+
+ax.axhline(sndr_ideal, color='gray', linestyle='--', linewidth=1,
+           label=f'Ideal ({sndr_ideal:.1f} dB)')
+ax.axhline(sndr_impaired_avg, color='gray', linestyle=':', linewidth=1,
+           label=f'Impaired avg ({sndr_impaired_avg:.1f} dB)')
+ax.set_xlabel('Calibration Iteration', fontsize=13)
+ax.set_ylabel('SNDR (dB)', fontsize=13)
+ax.set_title('Pipelined ADC Calibration: SNDR vs. Iteration\n'
+             '(4-stage, 2b/stage, no redundancy, sigma=30mV offsets & gain)',
+             fontsize=14)
+ax.legend(fontsize=10, loc='lower right')
+ax.grid(True, alpha=0.3)
+ax.set_xlim([1, N_ITER_CAL])
+plt.tight_layout()
+plt.savefig('fig3_calibration_comparison.png', dpi=150)
+plt.show()
+print("  -> Saved fig3_calibration_comparison.png")
+
+print("\n" + "=" * 60)
+print("Final SNDR after 100 iterations (averaged over MC):")
+print("=" * 60)
+for name, sndr_arr in results.items():
+    print(f"  {name:25s}: {sndr_arr[-1]:.2f} dB")
+print(f"  {'Ideal':25s}: {sndr_ideal:.2f} dB")
+print(f"  {'Impaired (no cal.)':25s}: {sndr_impaired_avg:.2f} dB")
+print("\nPart 1 complete.")
