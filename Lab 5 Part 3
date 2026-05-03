@@ -1,0 +1,338 @@
+# ECEN 432 - Lab 5, Section 3
+# Residue Amplifier (Ideal + Non-Ideal Models)
+# Jun | Texas A&M University
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ─────────────────────────────────────────────
+# Global Parameters
+# ─────────────────────────────────────────────
+VFS  = 1.0        # Full-scale voltage (V)
+G    = 4           # Ideal gain
+M    = 2048        # FFT length / number of samples
+C    = 113         # Frequency bin index (prime, bin-aligned)
+Fs   = 1e9         # Sampling frequency (Hz)
+Fin  = Fs * C / M  # Bin-aligned input frequency (Hz)
+L    = M           # Signal length = FFT length
+
+# Time and frequency vectors
+t = np.arange(1, L + 1) / Fs
+f = np.linspace(0, Fs / 2, L // 2 + 1)
+
+# Harmonic bin indices (for marking on PSD)
+H2_bin = 2 * C      # 2nd harmonic
+H3_bin = 3 * C      # 3rd harmonic
+
+
+# ═════════════════════════════════════════════
+# HELPER FUNCTIONS
+# ═════════════════════════════════════════════
+
+def compute_psd_linear(x):
+    """One-sided linear PSD (V^2/Hz) — same normalization as Lab 4."""
+    X   = np.fft.fft(x)[:L // 2 + 1]
+    psd = (1 / (Fs * L)) * np.abs(X)**2
+    psd[1:-1] *= 2   # double all bins except DC and Nyquist
+    return psd
+
+
+def compute_sndr_enob(x_out, signal_bin):
+    """
+    Compute SNDR and ENOB from FFT.
+    signal_bin: index of the fundamental tone in the one-sided spectrum.
+    """
+    psd = compute_psd_linear(x_out)
+    sig_power   = np.sum(psd[max(0, signal_bin - 1):signal_bin + 2])
+    total_power = np.sum(psd[1:])
+    nd_power    = total_power - sig_power
+    if nd_power <= 0:
+        nd_power = 1e-30
+    sndr = 10 * np.log10(sig_power / nd_power)
+    enob = (sndr - 1.76) / 6.02
+    return sndr, enob, psd
+
+
+def compute_sfdr(psd_db, signal_bin):
+    """
+    SFDR = fundamental power (dB) - largest spur power (dB).
+    Excludes DC (bin 0) and the fundamental (±1 bin).
+    """
+    fund_power = psd_db[signal_bin]
+    # Zero out fundamental region and DC to find largest spur
+    psd_copy = psd_db.copy()
+    psd_copy[0] = -np.inf
+    psd_copy[max(0, signal_bin - 1):signal_bin + 2] = -np.inf
+    spur_power = np.max(psd_copy)
+    return fund_power - spur_power
+
+
+def residue_amplifier(v_in, epsilon=0.0, v_offset=0.0, alpha2=0.0, alpha3=0.0):
+    """
+    Non-ideal residue amplifier model:
+      V_out = (1 + epsilon) * G * V_in + V_offset + alpha2 * V_in^2 + alpha3 * V_in^3
+
+    When epsilon = v_offset = alpha2 = alpha3 = 0, this is the ideal RA.
+    """
+    v_out = (1 + epsilon) * G * v_in + v_offset + alpha2 * v_in**2 + alpha3 * v_in**3
+    return v_out
+
+
+# ═════════════════════════════════════════════
+# PART (a) & (b): Ideal RA — Transfer Function
+# ═════════════════════════════════════════════
+print("=" * 60)
+print("SECTION 3: Residue Amplifier")
+print("=" * 60)
+
+N_sweep = 10000
+v_sweep = np.linspace(0, VFS, N_sweep)
+
+v_out_ideal = residue_amplifier(v_sweep)
+
+plt.figure(figsize=(10, 5))
+plt.plot(v_sweep, v_out_ideal, 'b-', linewidth=2, label='Ideal RA (G=4)')
+plt.plot(v_sweep, G * v_sweep, 'r--', linewidth=1, alpha=0.5, label=f'Reference: y = {G}x')
+plt.xlabel("Input Voltage (V)")
+plt.ylabel("Output Voltage (V)")
+plt.title("Part (a)/(b): Ideal Residue Amplifier Transfer Function")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+print(f"  Ideal RA: V_out = {G} * V_in")
+print(f"  Output range: [{v_out_ideal[0]:.4f}, {v_out_ideal[-1]:.4f}] V")
+print()
+
+
+# ═════════════════════════════════════════════
+# PART (c): Ideal RA — Single-Tone PSD, SNDR, ENOB
+# ═════════════════════════════════════════════
+# Input: single tone with amplitude near VFS
+A_sig    = VFS / 2
+v_in_tone = A_sig * np.cos(2 * np.pi * Fin * t) + VFS / 2   # [0, VFS]
+
+v_out_ideal_tone = residue_amplifier(v_in_tone)
+v_out_ideal_ac   = v_out_ideal_tone - np.mean(v_out_ideal_tone)
+
+sndr_ideal, enob_ideal, psd_ideal = compute_sndr_enob(v_out_ideal_ac, signal_bin=C)
+psd_ideal_db = 10 * np.log10(psd_ideal + 1e-30)
+
+plt.figure(figsize=(10, 5))
+plt.plot(f / 1e6, psd_ideal_db, 'b-', linewidth=0.8)
+plt.xlabel("Frequency (MHz)")
+plt.ylabel("PSD (dB/Hz)")
+plt.title(f"Part (c): Ideal RA PSD — SNDR = {sndr_ideal:.2f} dB, ENOB = {enob_ideal:.2f} bits")
+plt.grid(True)
+plt.xlim([0, Fs / 2 / 1e6])
+plt.tight_layout()
+plt.show()
+
+print(f"  Part (c): Ideal RA — SNDR = {sndr_ideal:.2f} dB, ENOB = {enob_ideal:.2f} bits")
+print(f"  (Ideal linear RA produces no distortion — SNDR limited by numerical precision)")
+print()
+
+
+# ═════════════════════════════════════════════
+# PART (d): Define Three Non-Ideal Setups
+# ═════════════════════════════════════════════
+# Setup 1: gain error + offset only
+# Setup 2: mild nonlinearity
+# Setup 3: stronger nonlinearity
+
+setups = {
+    1: {'epsilon': 0.05, 'v_offset': 0.2 * VFS, 'alpha2': 0.0,                  'alpha3': 0.0},
+    2: {'epsilon': 0.05, 'v_offset': 0.3 * VFS, 'alpha2': 0.02 / VFS**2,        'alpha3': 0.01 / VFS**3},
+    3: {'epsilon': 0.05, 'v_offset': 0.4 * VFS, 'alpha2': 0.05 / VFS**2,        'alpha3': 0.03 / VFS**3},
+}
+
+print("  Non-ideal setups:")
+for s, params in setups.items():
+    print(f"    Setup {s}: ε={params['epsilon']}, V_offset={params['v_offset']:.2f},"
+          f" α2={params['alpha2']:.4f}, α3={params['alpha3']:.4f}")
+print()
+
+
+# ═════════════════════════════════════════════
+# PART (e): Setup 1 — Transfer Function Comparison
+# ═════════════════════════════════════════════
+p1 = setups[1]
+v_out_s1 = residue_amplifier(v_sweep, **p1)
+
+plt.figure(figsize=(10, 5))
+plt.plot(v_sweep, v_out_ideal, 'b-',  linewidth=2,   label='Ideal')
+plt.plot(v_sweep, v_out_s1,    'r--', linewidth=1.5,  label='Setup 1 (ε + offset)')
+plt.xlabel("Input Voltage (V)")
+plt.ylabel("Output Voltage (V)")
+plt.title("Part (e): Transfer Function — Setup 1 vs. Ideal")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+print("  Part (e): Setup 1 introduces:")
+print(f"    - Gain error ε = {p1['epsilon']} → effective gain = {(1+p1['epsilon'])*G:.2f} (vs ideal {G})")
+print(f"    - DC offset = {p1['v_offset']:.2f} V → shifts the entire curve up")
+print("    - No nonlinearity → curve is still a straight line, just shifted & tilted")
+print()
+
+
+# ═════════════════════════════════════════════
+# PART (f): Setup 2 — PSD, SFDR, HD2, HD3
+# ═════════════════════════════════════════════
+p2 = setups[2]
+v_out_s2_tone = residue_amplifier(v_in_tone, **p2)
+v_out_s2_ac   = v_out_s2_tone - np.mean(v_out_s2_tone)
+
+sndr_s2, enob_s2, psd_s2 = compute_sndr_enob(v_out_s2_ac, signal_bin=C)
+psd_s2_db = 10 * np.log10(psd_s2 + 1e-30)
+sfdr_s2   = compute_sfdr(psd_s2_db, signal_bin=C)
+
+# HD2 and HD3 power levels
+hd2_power_db = psd_s2_db[H2_bin]
+hd3_power_db = psd_s2_db[H3_bin]
+
+plt.figure(figsize=(10, 5))
+plt.plot(f / 1e6, psd_s2_db,    'b-', linewidth=0.8, label='Setup 2')
+plt.plot(f / 1e6, psd_ideal_db, 'k--', linewidth=0.5, alpha=0.4, label='Ideal')
+# Mark fundamental
+plt.plot(f[C] / 1e6, psd_s2_db[C], 'go', markersize=10, label=f'Fundamental ({psd_s2_db[C]:.1f} dB)')
+# Mark HD2
+plt.plot(f[H2_bin] / 1e6, hd2_power_db, 'r^', markersize=10, label=f'HD2 ({hd2_power_db:.1f} dB)')
+# Mark HD3
+plt.plot(f[H3_bin] / 1e6, hd3_power_db, 'ms', markersize=10, label=f'HD3 ({hd3_power_db:.1f} dB)')
+plt.xlabel("Frequency (MHz)")
+plt.ylabel("PSD (dB/Hz)")
+plt.title(f"Part (f): Setup 2 PSD — SNDR = {sndr_s2:.2f} dB, ENOB = {enob_s2:.2f}, SFDR = {sfdr_s2:.2f} dB")
+plt.legend(loc='upper right')
+plt.grid(True)
+plt.xlim([0, Fs / 2 / 1e6])
+plt.tight_layout()
+plt.show()
+
+print(f"  Part (f): Setup 2")
+print(f"    SNDR  = {sndr_s2:.2f} dB    (ideal: {sndr_ideal:.2f} dB)")
+print(f"    ENOB  = {enob_s2:.2f} bits  (ideal: {enob_ideal:.2f} bits)")
+print(f"    SFDR  = {sfdr_s2:.2f} dB")
+print(f"    HD2   = {hd2_power_db:.2f} dB/Hz  at {f[H2_bin]/1e6:.2f} MHz")
+print(f"    HD3   = {hd3_power_db:.2f} dB/Hz  at {f[H3_bin]/1e6:.2f} MHz")
+print(f"    α2 introduces even-order distortion (HD2), α3 introduces odd-order (HD3)")
+print()
+
+
+# ═════════════════════════════════════════════
+# PART (g): Setup 3 — PSD, SFDR, HD2, HD3
+# ═════════════════════════════════════════════
+p3 = setups[3]
+v_out_s3_tone = residue_amplifier(v_in_tone, **p3)
+v_out_s3_ac   = v_out_s3_tone - np.mean(v_out_s3_tone)
+
+sndr_s3, enob_s3, psd_s3 = compute_sndr_enob(v_out_s3_ac, signal_bin=C)
+psd_s3_db = 10 * np.log10(psd_s3 + 1e-30)
+sfdr_s3   = compute_sfdr(psd_s3_db, signal_bin=C)
+
+hd2_s3_db = psd_s3_db[H2_bin]
+hd3_s3_db = psd_s3_db[H3_bin]
+
+plt.figure(figsize=(10, 5))
+plt.plot(f / 1e6, psd_s3_db,    'b-',  linewidth=0.8, label='Setup 3')
+plt.plot(f / 1e6, psd_ideal_db, 'k--', linewidth=0.5, alpha=0.4, label='Ideal')
+plt.plot(f[C] / 1e6,      psd_s3_db[C], 'go', markersize=10, label=f'Fundamental ({psd_s3_db[C]:.1f} dB)')
+plt.plot(f[H2_bin] / 1e6, hd2_s3_db,    'r^', markersize=10, label=f'HD2 ({hd2_s3_db:.1f} dB)')
+plt.plot(f[H3_bin] / 1e6, hd3_s3_db,    'ms', markersize=10, label=f'HD3 ({hd3_s3_db:.1f} dB)')
+plt.xlabel("Frequency (MHz)")
+plt.ylabel("PSD (dB/Hz)")
+plt.title(f"Part (g): Setup 3 PSD — SNDR = {sndr_s3:.2f} dB, ENOB = {enob_s3:.2f}, SFDR = {sfdr_s3:.2f} dB")
+plt.legend(loc='upper right')
+plt.grid(True)
+plt.xlim([0, Fs / 2 / 1e6])
+plt.tight_layout()
+plt.show()
+
+print(f"  Part (g): Setup 3")
+print(f"    SNDR  = {sndr_s3:.2f} dB    (ideal: {sndr_ideal:.2f} dB)")
+print(f"    ENOB  = {enob_s3:.2f} bits  (ideal: {enob_ideal:.2f} bits)")
+print(f"    SFDR  = {sfdr_s3:.2f} dB")
+print(f"    HD2   = {hd2_s3_db:.2f} dB/Hz")
+print(f"    HD3   = {hd3_s3_db:.2f} dB/Hz")
+print()
+print("    Comparison Setup 2 → Setup 3:")
+print(f"    α2: {p2['alpha2']:.4f} → {p3['alpha2']:.4f}  →  HD2 rose by {hd2_s3_db - hd2_power_db:.1f} dB")
+print(f"    α3: {p2['alpha3']:.4f} → {p3['alpha3']:.4f}  →  HD3 rose by {hd3_s3_db - hd3_power_db:.1f} dB")
+print(f"    Larger α2/α3 increases harmonic distortion, degrading SNDR/ENOB.")
+print(f"    Offset increase shifts DC but does not add harmonics (removed by AC coupling).")
+print()
+
+
+# ═════════════════════════════════════════════
+# PART (h): Sweep α2 — HD2 vs α2
+# ═════════════════════════════════════════════
+alpha2_sweep = np.linspace(0, 0.1 / VFS**2, 50)
+hd2_vs_a2    = np.zeros(len(alpha2_sweep))
+
+for i, a2 in enumerate(alpha2_sweep):
+    v_out_tmp = residue_amplifier(v_in_tone, epsilon=0.0, v_offset=0.0,
+                                  alpha2=a2, alpha3=0.0)
+    v_out_ac  = v_out_tmp - np.mean(v_out_tmp)
+    psd_tmp   = compute_psd_linear(v_out_ac)
+    psd_tmp_db = 10 * np.log10(psd_tmp + 1e-30)
+    hd2_vs_a2[i] = psd_tmp_db[H2_bin]
+
+plt.figure(figsize=(10, 5))
+plt.plot(alpha2_sweep * VFS**2, hd2_vs_a2, 'r-o', markersize=4, linewidth=1.5)
+plt.xlabel("α₂ (normalized, ×VFS²)")
+plt.ylabel("HD2 Power (dB/Hz)")
+plt.title("Part (h): HD2 vs. α₂ (all other parameters = 0)")
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+print("  Part (h): HD2 increases with α₂.")
+print("  α₂ controls 2nd-order nonlinearity → generates energy at 2×Fin (HD2).")
+print("  The relationship is approximately linear in dB for small α₂,")
+print("  following HD2 ∝ α₂ (20 dB/decade slope).")
+print()
+
+
+# ═════════════════════════════════════════════
+# PART (i): Sweep α3 — HD3 vs α3
+# ═════════════════════════════════════════════
+alpha3_sweep = np.linspace(0, 0.06 / VFS**3, 50)
+hd3_vs_a3    = np.zeros(len(alpha3_sweep))
+
+for i, a3 in enumerate(alpha3_sweep):
+    v_out_tmp = residue_amplifier(v_in_tone, epsilon=0.0, v_offset=0.0,
+                                  alpha2=0.0, alpha3=a3)
+    v_out_ac  = v_out_tmp - np.mean(v_out_tmp)
+    psd_tmp   = compute_psd_linear(v_out_ac)
+    psd_tmp_db = 10 * np.log10(psd_tmp + 1e-30)
+    hd3_vs_a3[i] = psd_tmp_db[H3_bin]
+
+plt.figure(figsize=(10, 5))
+plt.plot(alpha3_sweep * VFS**3, hd3_vs_a3, 'm-o', markersize=4, linewidth=1.5)
+plt.xlabel("α₃ (normalized, ×VFS³)")
+plt.ylabel("HD3 Power (dB/Hz)")
+plt.title("Part (i): HD3 vs. α₃ (all other parameters = 0)")
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+print("  Part (i): HD3 increases with α₃.")
+print("  α₃ controls 3rd-order nonlinearity → generates energy at 3×Fin (HD3).")
+print("  HD3 ∝ α₃ for small values (20 dB/decade slope).")
+print("  3rd-order distortion also compresses the fundamental (gain compression).")
+print()
+
+
+# ═════════════════════════════════════════════
+# SUMMARY TABLE
+# ═════════════════════════════════════════════
+print("=" * 60)
+print("SECTION 3 SUMMARY")
+print("=" * 60)
+print(f"  {'':15s}  {'SNDR (dB)':>10s}  {'ENOB':>8s}  {'SFDR (dB)':>10s}")
+print(f"  {'-'*15}  {'-'*10}  {'-'*8}  {'-'*10}")
+print(f"  {'Ideal':15s}  {sndr_ideal:10.2f}  {enob_ideal:8.2f}  {'N/A':>10s}")
+print(f"  {'Setup 2':15s}  {sndr_s2:10.2f}  {enob_s2:8.2f}  {sfdr_s2:10.2f}")
+print(f"  {'Setup 3':15s}  {sndr_s3:10.2f}  {enob_s3:8.2f}  {sfdr_s3:10.2f}")
