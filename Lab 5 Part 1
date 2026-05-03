@@ -1,0 +1,456 @@
+# ECEN 432 - Lab 5, Section 1
+# 2.5-bit Flash ADC with 1-bit Interstage Redundancy
+# Jun | Texas A&M University
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ─────────────────────────────────────────────
+# Global Parameters
+# ─────────────────────────────────────────────
+VFS      = 1.0        # Full-scale voltage (V)
+N_bits   = 3          # 2.5-bit → 3-bit digital output (6 comparators, 1-bit redundancy)
+N_comp   = 6          # Number of comparators for 2.5-bit flash (2^2.5 - 1 ≈ 6 with redundancy)
+M        = 2048       # FFT length / number of samples
+C        = 113        # Frequency bin index (prime → avoids spectral leakage)
+Fs       = 1e9        # Sampling frequency (Hz)
+Fin      = Fs * C / M # Bin-aligned input frequency (Hz)
+L        = M          # Signal length = FFT length
+
+# ─────────────────────────────────────────────
+# 2.5-bit Flash ADC Reference Levels (with redundancy)
+# ─────────────────────────────────────────────
+# A standard 2-bit flash has 3 comparators at VFS/4, 2*VFS/4, 3*VFS/4.
+# A 2.5-bit flash with 1-bit redundancy uses 6 comparators.
+# The redundancy overlaps decision levels so that comparator offsets
+# can be corrected by digital post-processing.
+#
+# Reference levels are spaced at VFS/8 intervals:
+#   VFS/8, 2*VFS/8, 3*VFS/8, 4*VFS/8, 5*VFS/8, 6*VFS/8
+# i.e. 0.125, 0.25, 0.375, 0.5, 0.625, 0.75
+
+V_ref = np.array([VFS * (i + 1) / 8 for i in range(N_comp)])
+# V_ref = [0.125, 0.25, 0.375, 0.5, 0.625, 0.75]
+
+# Ideal LSB for 3-bit output (8 levels over VFS)
+LSB = VFS / 8
+
+# Time and frequency vectors
+t = np.arange(1, L + 1) / Fs
+f = np.linspace(0, Fs / 2, L // 2 + 1)
+
+
+# ═════════════════════════════════════════════
+# HELPER FUNCTIONS
+# ═════════════════════════════════════════════
+
+def comparator(v_in, v_ref, offset=0.0, gain_err=0.0, alpha2=0.0, alpha3=0.0):
+    """
+    Non-ideal comparator model.
+    Effective threshold = v_ref + offset + gain_err * v_in + alpha2 * v_in^2 + alpha3 * v_in^3
+    Returns 1 if v_in > effective threshold, else 0.
+    """
+    v_eff = v_ref + offset + gain_err * v_in + alpha2 * v_in**2 + alpha3 * v_in**3
+    return (v_in > v_eff).astype(int)
+
+
+def thermometer_to_digital(therm):
+    """
+    Convert thermometer code (6 comparators) to 3-bit digital output.
+    Digital output = number of 1s in thermometer code (sum), capped at 7.
+    """
+    return np.minimum(np.sum(therm, axis=0), 7).astype(int)
+
+
+def flash_adc_25bit(v_in, offsets=None, gain_errs=None, alpha2s=None, alpha3s=None):
+    """
+    2.5-bit flash ADC with redundancy.
+    Returns 3-bit digital output codes (0 to 7).
+    """
+    if offsets   is None: offsets   = np.zeros(N_comp)
+    if gain_errs is None: gain_errs = np.zeros(N_comp)
+    if alpha2s   is None: alpha2s   = np.zeros(N_comp)
+    if alpha3s   is None: alpha3s   = np.zeros(N_comp)
+
+    # Generate thermometer code from all 6 comparators
+    therm = np.zeros((N_comp, len(v_in)))
+    for i in range(N_comp):
+        therm[i] = comparator(v_in, V_ref[i],
+                              offset=offsets[i],
+                              gain_err=gain_errs[i],
+                              alpha2=alpha2s[i],
+                              alpha3=alpha3s[i])
+
+    # Convert thermometer → digital
+    d_out = thermometer_to_digital(therm)
+    return d_out, therm
+
+
+def digital_to_analog(d_out):
+    """Convert digital code back to analog (for error computation)."""
+    return d_out * LSB + LSB / 2   # midpoint of each quantization bin
+
+
+def compute_psd_linear(x):
+    """One-sided linear PSD (V^2/Hz) — same normalization as Lab 4."""
+    X   = np.fft.fft(x)[:L // 2 + 1]
+    psd = (1 / (Fs * L)) * np.abs(X)**2
+    psd[1:-1] *= 2   # double all bins except DC and Nyquist
+    return psd
+
+
+def compute_sndr_enob(x_out, signal_bin):
+    """
+    Compute SNDR and ENOB from FFT.
+    signal_bin: index of the fundamental tone in the one-sided spectrum.
+    """
+    psd = compute_psd_linear(x_out)
+    # Signal power: fundamental bin (±1 bin for leakage)
+    sig_power = np.sum(psd[max(0, signal_bin - 1):signal_bin + 2])
+    # Total power (exclude DC bin 0)
+    total_power = np.sum(psd[1:])
+    # Noise + distortion
+    nd_power = total_power - sig_power
+    if nd_power <= 0:
+        nd_power = 1e-30
+    sndr = 10 * np.log10(sig_power / nd_power)
+    enob = (sndr - 1.76) / 6.02
+    return sndr, enob, psd
+
+
+# ═════════════════════════════════════════════
+# PART (a): Design the 2.5-bit flash ADC
+# ═════════════════════════════════════════════
+print("=" * 60)
+print("PART (a): 2.5-bit Flash ADC Design")
+print("=" * 60)
+print(f"  Full-scale voltage VFS    = {VFS} V")
+print(f"  Number of comparators     = {N_comp}")
+print(f"  Reference levels (V)      = {V_ref}")
+print(f"  LSB                       = {LSB:.4f} V")
+print(f"  Digital output range      = 0 to 7 (3 bits)")
+print(f"  1-bit interstage redundancy included")
+print()
+
+
+# ═════════════════════════════════════════════
+# PART (b): Transfer Characteristic
+# ═════════════════════════════════════════════
+N_sweep = 10000
+v_sweep = np.linspace(0, VFS, N_sweep)
+d_out_sweep, therm_sweep = flash_adc_25bit(v_sweep)
+
+# Print thermometer codes at a few points
+print("=" * 60)
+print("PART (b): Thermometer Code Samples")
+print("=" * 60)
+sample_voltages = [0.05, 0.15, 0.3, 0.45, 0.55, 0.7, 0.85, 0.95]
+for sv in sample_voltages:
+    idx = np.argmin(np.abs(v_sweep - sv))
+    tc = therm_sweep[:, idx].astype(int)
+    print(f"  Vin = {sv:.2f} V → Therm = {tc} → Digital = {d_out_sweep[idx]}")
+print()
+
+# Plot transfer characteristic
+plt.figure(figsize=(10, 5))
+plt.plot(v_sweep, d_out_sweep, 'b-', linewidth=1.5)
+plt.xlabel("Input Voltage (V)")
+plt.ylabel("Digital Output Code")
+plt.title("Part (b): 2.5-bit Flash ADC Transfer Characteristic (Ideal)")
+plt.grid(True)
+plt.yticks(range(8))
+plt.tight_layout()
+plt.show()
+
+
+# ═════════════════════════════════════════════
+# PART (c): Quantization Error
+# ═════════════════════════════════════════════
+v_reconstructed = digital_to_analog(d_out_sweep)
+quant_error = v_sweep - v_reconstructed
+
+plt.figure(figsize=(10, 5))
+plt.plot(v_sweep, quant_error * 1000, 'r-', linewidth=1)
+plt.xlabel("Input Voltage (V)")
+plt.ylabel("Quantization Error (mV)")
+plt.title("Part (c): Quantization Error vs. Input Voltage")
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+print("=" * 60)
+print("PART (c): Quantization Error")
+print("=" * 60)
+print(f"  Min quantization error = {np.min(quant_error)*1000:.2f} mV")
+print(f"  Max quantization error = {np.max(quant_error)*1000:.2f} mV")
+print(f"  Expected: ±LSB/2 = ±{LSB/2*1000:.2f} mV")
+print()
+
+
+# ═════════════════════════════════════════════
+# PART (d): Non-ideal Comparators — 100 Random Trials
+# ═════════════════════════════════════════════
+# Error ranges (reasonable for demonstration)
+offset_range  = 0.05    # ±50 mV offset
+gain_err_range = 0.02   # ±2% gain error
+alpha2_range  = 0.1     # 2nd order nonlinearity coefficient
+alpha3_range  = 0.1     # 3rd order nonlinearity coefficient
+
+plt.figure(figsize=(10, 6))
+
+# Plot ideal first
+d_ideal, _ = flash_adc_25bit(v_sweep)
+plt.plot(v_sweep, d_ideal, 'k-', linewidth=2.5, label='Ideal', zorder=10)
+
+# 100 random trials
+for trial in range(100):
+    np.random.seed(trial)
+    offsets   = np.random.uniform(-offset_range,   offset_range,   N_comp)
+    gain_errs = np.random.uniform(-gain_err_range, gain_err_range, N_comp)
+    alpha2s   = np.random.uniform(-alpha2_range,   alpha2_range,   N_comp)
+    alpha3s   = np.random.uniform(-alpha3_range,   alpha3_range,   N_comp)
+
+    d_out_ni, _ = flash_adc_25bit(v_sweep, offsets, gain_errs, alpha2s, alpha3s)
+    plt.plot(v_sweep, d_out_ni, 'b-', alpha=0.05, linewidth=0.5)
+
+plt.xlabel("Input Voltage (V)")
+plt.ylabel("Digital Output Code")
+plt.title("Part (d): ADC Transfer Characteristics — 100 Random Non-Ideal Trials vs. Ideal")
+plt.grid(True)
+plt.yticks(range(8))
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+
+# ═════════════════════════════════════════════
+# PART (e): DNL and INL (Offset Errors Only)
+# ═════════════════════════════════════════════
+# Use a fine ramp to compute transition points
+N_fine = 100000
+v_fine = np.linspace(0, VFS, N_fine)
+
+# With offset errors only (gain_err = alpha2 = alpha3 = 0)
+np.random.seed(42)
+offsets_only = np.random.uniform(-offset_range, offset_range, N_comp)
+
+d_out_offset, _ = flash_adc_25bit(v_fine, offsets=offsets_only)
+
+# Find transition voltages (where digital code changes)
+transitions_ideal  = V_ref   # Ideal transitions at reference levels
+transitions_actual = []
+for code in range(1, 8):
+    idx = np.where(d_out_offset >= code)[0]
+    if len(idx) > 0:
+        transitions_actual.append(v_fine[idx[0]])
+    else:
+        transitions_actual.append(VFS)  # never reached
+
+transitions_actual = np.array(transitions_actual)
+
+# Actual step widths
+step_widths = np.diff(np.concatenate(([0], transitions_actual, [VFS])))
+ideal_step  = LSB
+
+# DNL = (actual step width - ideal step width) / ideal step width
+dnl = (step_widths - ideal_step) / ideal_step
+
+# INL = cumulative sum of DNL
+inl = np.cumsum(dnl)
+
+print("=" * 60)
+print("PART (e): DNL and INL (Offset Errors Only)")
+print("=" * 60)
+print(f"  Offset errors used: {offsets_only * 1000} mV")
+print(f"  Transition voltages (ideal):  {transitions_ideal}")
+print(f"  Transition voltages (actual): {transitions_actual}")
+print(f"  DNL (LSB): {dnl}")
+print(f"  INL (LSB): {inl}")
+print(f"  Max |DNL| = {np.max(np.abs(dnl)):.4f} LSB")
+print(f"  Max |INL| = {np.max(np.abs(inl)):.4f} LSB")
+print()
+
+fig, axes = plt.subplots(2, 1, figsize=(10, 8))
+
+axes[0].bar(range(len(dnl)), dnl, color='steelblue', edgecolor='black')
+axes[0].axhline(y=0, color='k', linewidth=0.5)
+axes[0].axhline(y=0.5, color='r', linestyle='--', alpha=0.5, label='±0.5 LSB')
+axes[0].axhline(y=-0.5, color='r', linestyle='--', alpha=0.5)
+axes[0].set_xlabel("Digital Output Code")
+axes[0].set_ylabel("DNL (LSB)")
+axes[0].set_title("Part (e): Differential Nonlinearity (DNL)")
+axes[0].legend()
+axes[0].grid(True, alpha=0.3)
+
+axes[1].bar(range(len(inl)), inl, color='coral', edgecolor='black')
+axes[1].axhline(y=0, color='k', linewidth=0.5)
+axes[1].axhline(y=0.5, color='r', linestyle='--', alpha=0.5, label='±0.5 LSB')
+axes[1].axhline(y=-0.5, color='r', linestyle='--', alpha=0.5)
+axes[1].set_xlabel("Digital Output Code")
+axes[1].set_ylabel("INL (LSB)")
+axes[1].set_title("Part (e): Integral Nonlinearity (INL)")
+axes[1].legend()
+axes[1].grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.show()
+
+
+# ═════════════════════════════════════════════
+# PART (f): Single-Tone PSD, SNDR, ENOB
+# ═════════════════════════════════════════════
+# Input: full-scale single tone (bin-aligned)
+A_sig = VFS / 2       # Amplitude: signal swings 0 to VFS → centered at VFS/2
+v_in_tone = A_sig * np.cos(2 * np.pi * Fin * t) + VFS / 2  # DC offset to [0, VFS]
+
+# Quantize through ideal flash ADC
+d_out_tone, _ = flash_adc_25bit(v_in_tone)
+v_out_tone = digital_to_analog(d_out_tone)
+
+# Remove DC for PSD
+v_out_ac = v_out_tone - np.mean(v_out_tone)
+v_in_ac  = v_in_tone  - np.mean(v_in_tone)
+
+# PSD and SNDR
+sndr, enob, psd_out = compute_sndr_enob(v_out_ac, signal_bin=C)
+psd_db = 10 * np.log10(psd_out + 1e-30)
+
+# Plot input vs output waveforms (first 200 samples)
+fig, axes = plt.subplots(2, 1, figsize=(10, 8))
+
+N_show = 200
+axes[0].plot(t[:N_show] * 1e9, v_in_tone[:N_show], 'b-', linewidth=1, label='Input')
+axes[0].step(t[:N_show] * 1e9, v_out_tone[:N_show], 'r-', linewidth=1, label='ADC Output', where='mid')
+axes[0].set_xlabel("Time (ns)")
+axes[0].set_ylabel("Voltage (V)")
+axes[0].set_title("Part (f): Input and ADC Output Waveforms")
+axes[0].legend()
+axes[0].grid(True)
+
+axes[1].plot(f / 1e6, psd_db, 'b-', linewidth=0.8)
+axes[1].set_xlabel("Frequency (MHz)")
+axes[1].set_ylabel("PSD (dB/Hz)")
+axes[1].set_title(f"Part (f): PSD of ADC Output — SNDR = {sndr:.2f} dB, ENOB = {enob:.2f} bits")
+axes[1].grid(True)
+axes[1].set_xlim([0, Fs / 2 / 1e6])
+
+plt.tight_layout()
+plt.show()
+
+print("=" * 60)
+print("PART (f): Single-Tone Analysis")
+print("=" * 60)
+print(f"  Input frequency (bin-aligned) = {Fin/1e6:.2f} MHz")
+print(f"  SNDR = {sndr:.2f} dB")
+print(f"  ENOB = {enob:.2f} bits")
+print(f"  Ideal SNDR for 3-bit = {6.02*3 + 1.76:.2f} dB")
+print()
+
+
+# ═════════════════════════════════════════════
+# PART (g): Monte Carlo — 50 Iterations
+# ═════════════════════════════════════════════
+N_mc = 50
+sndr_mc = np.zeros(N_mc)
+enob_mc = np.zeros(N_mc)
+dnl_max_mc = np.zeros(N_mc)
+inl_max_mc = np.zeros(N_mc)
+
+for mc in range(N_mc):
+    np.random.seed(mc + 1000)  # distinct seeds from part (d)
+
+    # Random non-idealities for all comparators
+    offsets_mc   = np.random.uniform(-offset_range,   offset_range,   N_comp)
+    gain_errs_mc = np.random.uniform(-gain_err_range, gain_err_range, N_comp)
+    alpha2s_mc   = np.random.uniform(-alpha2_range,   alpha2_range,   N_comp)
+    alpha3s_mc   = np.random.uniform(-alpha3_range,   alpha3_range,   N_comp)
+
+    # --- SNDR / ENOB (single-tone) ---
+    d_out_mc, _ = flash_adc_25bit(v_in_tone, offsets_mc, gain_errs_mc, alpha2s_mc, alpha3s_mc)
+    v_out_mc = digital_to_analog(d_out_mc)
+    v_out_mc_ac = v_out_mc - np.mean(v_out_mc)
+    sndr_mc[mc], enob_mc[mc], _ = compute_sndr_enob(v_out_mc_ac, signal_bin=C)
+
+    # --- DNL / INL (fine ramp, offset errors only for consistency with part e) ---
+    d_ramp_mc, _ = flash_adc_25bit(v_fine, offsets=offsets_mc)
+    trans_mc = []
+    for code in range(1, 8):
+        idx = np.where(d_ramp_mc >= code)[0]
+        if len(idx) > 0:
+            trans_mc.append(v_fine[idx[0]])
+        else:
+            trans_mc.append(VFS)
+    trans_mc = np.array(trans_mc)
+    sw_mc = np.diff(np.concatenate(([0], trans_mc, [VFS])))
+    dnl_mc_vals = (sw_mc - ideal_step) / ideal_step
+    inl_mc_vals = np.cumsum(dnl_mc_vals)
+    dnl_max_mc[mc] = np.max(np.abs(dnl_mc_vals))
+    inl_max_mc[mc] = np.max(np.abs(inl_mc_vals))
+
+# --- Safe histogram helper ---
+def safe_hist(ax, data, max_bins=15, **kwargs):
+    """Histogram that handles zero-spread or near-zero-spread data."""
+    data_range = np.ptp(data)
+    if data_range == 0:
+        # All values identical — create a single bar manually
+        center = data[0]
+        width = max(abs(center) * 0.1, 0.01)  # 10% of value or 0.01
+        ax.bar(center, len(data), width=width, **kwargs)
+    else:
+        n_unique = len(np.unique(np.round(data, 10)))
+        n_bins = max(1, min(max_bins, n_unique))
+        ax.hist(data, bins=n_bins, **kwargs)
+
+# --- Histograms ---
+fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+
+safe_hist(axes[0, 0], sndr_mc, color='steelblue', edgecolor='black', alpha=0.8)
+axes[0, 0].axvline(x=np.mean(sndr_mc), color='r', linestyle='--', label=f'Mean = {np.mean(sndr_mc):.2f} dB')
+axes[0, 0].set_xlabel("SNDR (dB)")
+axes[0, 0].set_ylabel("Count")
+axes[0, 0].set_title("Part (g): SNDR Histogram (50 MC iterations)")
+axes[0, 0].legend()
+axes[0, 0].grid(True, alpha=0.3)
+
+safe_hist(axes[0, 1], enob_mc, color='coral', edgecolor='black', alpha=0.8)
+axes[0, 1].axvline(x=np.mean(enob_mc), color='r', linestyle='--', label=f'Mean = {np.mean(enob_mc):.2f} bits')
+axes[0, 1].set_xlabel("ENOB (bits)")
+axes[0, 1].set_ylabel("Count")
+axes[0, 1].set_title("Part (g): ENOB Histogram (50 MC iterations)")
+axes[0, 1].legend()
+axes[0, 1].grid(True, alpha=0.3)
+
+safe_hist(axes[1, 0], dnl_max_mc, color='mediumpurple', edgecolor='black', alpha=0.8)
+axes[1, 0].axvline(x=np.mean(dnl_max_mc), color='r', linestyle='--', label=f'Mean = {np.mean(dnl_max_mc):.2f} LSB')
+axes[1, 0].set_xlabel("Max |DNL| (LSB)")
+axes[1, 0].set_ylabel("Count")
+axes[1, 0].set_title("Part (g): Max |DNL| Histogram")
+axes[1, 0].legend()
+axes[1, 0].grid(True, alpha=0.3)
+
+safe_hist(axes[1, 1], inl_max_mc, color='mediumseagreen', edgecolor='black', alpha=0.8)
+axes[1, 1].axvline(x=np.mean(inl_max_mc), color='r', linestyle='--', label=f'Mean = {np.mean(inl_max_mc):.2f} LSB')
+axes[1, 1].set_xlabel("Max |INL| (LSB)")
+axes[1, 1].set_ylabel("Count")
+axes[1, 1].set_title("Part (g): Max |INL| Histogram")
+axes[1, 1].legend()
+axes[1, 1].grid(True, alpha=0.3)
+
+plt.suptitle("Monte Carlo Analysis — 2.5-bit Flash ADC with Redundancy", fontsize=13, y=1.01)
+plt.tight_layout()
+plt.show()
+
+print("=" * 60)
+print("PART (g): Monte Carlo Results (50 iterations)")
+print("=" * 60)
+print(f"  SNDR: mean = {np.mean(sndr_mc):.2f} dB,  std = {np.std(sndr_mc):.2f} dB")
+print(f"  ENOB: mean = {np.mean(enob_mc):.2f} bits, std = {np.std(enob_mc):.2f} bits")
+print(f"  Max |DNL|: mean = {np.mean(dnl_max_mc):.4f} LSB")
+print(f"  Max |INL|: mean = {np.mean(inl_max_mc):.4f} LSB")
+print()
+print("  Analysis: Redundancy helps correct comparator offset errors because")
+print("  the overlapping decision regions allow the digital error correction")
+print("  logic to map shifted transitions back to the correct code. This")
+print("  improves DNL/INL under offset errors. However, gain errors and")
+print("  nonlinearities in the comparators still degrade SNDR/ENOB since")
+print("  they distort the signal path and are not corrected by redundancy.")
