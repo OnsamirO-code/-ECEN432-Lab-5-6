@@ -1,0 +1,534 @@
+# ECEN 432 - Lab 5, Section 4
+# 3-Stage Pipelined ADC (2.5 bits per stage)
+# Jun | Texas A&M University
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ─────────────────────────────────────────────
+# Global Parameters
+# ─────────────────────────────────────────────
+VFS      = 1.0        # Full-scale voltage (V)
+N_comp   = 6          # Comparators per stage (2.5-bit with redundancy)
+N_stages = 3          # Number of pipeline stages
+LSB_sub  = VFS / 8    # Sub-ADC LSB (3-bit output per stage)
+G        = 4          # Interstage gain = 2^2
+M        = 2048       # FFT length
+C        = 113        # Bin-aligned frequency index
+Fs       = 1e9        # Sampling frequency
+Fin      = Fs * C / M # Input frequency
+L        = M
+
+# Time and frequency vectors
+t = np.arange(1, L + 1) / Fs
+f = np.linspace(0, Fs / 2, L // 2 + 1)
+
+# Reference levels for 2.5-bit sub-ADC (with redundancy)
+V_ref_redundant = np.array([VFS * (i + 1) / 8 for i in range(N_comp)])
+
+# Reference levels for 2-bit sub-ADC (without redundancy): 3 comparators
+N_comp_nr = 3
+V_ref_no_redundancy = np.array([VFS * (i + 1) / 4 for i in range(N_comp_nr)])
+
+
+# ═════════════════════════════════════════════
+# HELPER FUNCTIONS
+# ═════════════════════════════════════════════
+
+def compute_psd_linear(x):
+    """One-sided linear PSD (V^2/Hz)."""
+    X   = np.fft.fft(x)[:L // 2 + 1]
+    psd = (1 / (Fs * L)) * np.abs(X)**2
+    psd[1:-1] *= 2
+    return psd
+
+
+def compute_sndr_enob(x_out, signal_bin):
+    """Compute SNDR and ENOB from FFT."""
+    psd = compute_psd_linear(x_out)
+    sig_power   = np.sum(psd[max(0, signal_bin - 1):signal_bin + 2])
+    total_power = np.sum(psd[1:])
+    nd_power    = total_power - sig_power
+    if nd_power <= 0:
+        nd_power = 1e-30
+    sndr = 10 * np.log10(sig_power / nd_power)
+    enob = (sndr - 1.76) / 6.02
+    return sndr, enob, psd
+
+
+# ─────────────────────────────────────────────
+# Sub-ADC (with and without redundancy)
+# ─────────────────────────────────────────────
+
+def sub_adc(v_in, v_ref, n_comp, offsets=None, gain_errs=None, alpha2s=None, alpha3s=None):
+    """
+    General sub-ADC: thermometer code → digital code.
+    Works for both 2.5-bit (6 comp, redundant) and 2-bit (3 comp, no redundancy).
+    """
+    if offsets   is None: offsets   = np.zeros(n_comp)
+    if gain_errs is None: gain_errs = np.zeros(n_comp)
+    if alpha2s   is None: alpha2s   = np.zeros(n_comp)
+    if alpha3s   is None: alpha3s   = np.zeros(n_comp)
+
+    n = len(v_in)
+    therm = np.zeros((n_comp, n))
+    for i in range(n_comp):
+        v_eff = v_ref[i] + offsets[i] + gain_errs[i] * v_in + alpha2s[i] * v_in**2 + alpha3s[i] * v_in**3
+        therm[i] = (v_in > v_eff).astype(int)
+
+    max_code = 2**3 - 1 if n_comp == 6 else 2**2 - 1  # 7 for redundant, 3 for non-redundant
+    d_out = np.minimum(np.sum(therm, axis=0), max_code).astype(int)
+    return d_out
+
+
+def sub_dac(d_code, lsb):
+    """DAC reconstruction: midpoint of quantization bin."""
+    return d_code * lsb + lsb / 2
+
+
+def residue_amplifier(v_in, epsilon=0.0, v_offset=0.0, alpha2=0.0, alpha3=0.0):
+    """Non-ideal residue amplifier: V_out = (1+ε)·G·V_in + V_offset + α2·V_in² + α3·V_in³"""
+    return (1 + epsilon) * G * v_in + v_offset + alpha2 * v_in**2 + alpha3 * v_in**3
+
+
+# ─────────────────────────────────────────────
+# Pipeline Stage
+# ─────────────────────────────────────────────
+
+def pipeline_stage(v_in, v_ref, n_comp, lsb,
+                   sub_adc_params=None, ra_params=None):
+    """
+    Single pipeline stage:
+      1. Sub-ADC quantizes v_in → digital code
+      2. DAC reconstructs → v_dac
+      3. Residue = RA( v_in - v_dac )
+
+    Returns: (digital_code, residue_out)
+    """
+    if sub_adc_params is None:
+        sub_adc_params = {}
+    if ra_params is None:
+        ra_params = {}
+
+    d_code = sub_adc(v_in, v_ref, n_comp, **sub_adc_params)
+    v_dac  = sub_dac(d_code, lsb)
+    v_diff = v_in - v_dac
+    v_res  = residue_amplifier(v_diff, **ra_params)
+    return d_code, v_res
+
+
+# ─────────────────────────────────────────────
+# Full 3-Stage Pipeline (with redundancy)
+# ─────────────────────────────────────────────
+
+def pipelined_adc_redundant(v_in,
+                            sub_adc_params=None,   # list of 3 dicts
+                            ra_params=None):       # list of 3 dicts (last stage RA not used)
+    """
+    3-stage pipelined ADC, 2.5 bits/stage with 1-bit redundancy.
+    Each stage outputs 3 raw bits; digital correction combines them.
+
+    With redundancy:
+      - Each stage: 2 effective bits + 1 redundant bit
+      - Total raw bits: 3 × 3 = 9
+      - After digital correction: 3 × 2 + 1 = 7 bits
+    """
+    if sub_adc_params is None:
+        sub_adc_params = [{}, {}, {}]
+    if ra_params is None:
+        ra_params = [{}, {}, {}]
+
+    n = len(v_in)
+    d_codes = []
+
+    # Stage 1
+    d1, v_res1 = pipeline_stage(v_in, V_ref_redundant, N_comp, LSB_sub,
+                                sub_adc_params[0], ra_params[0])
+    # Clip residue to [0, VFS] for next stage input
+    v_res1 = np.clip(v_res1, 0, VFS)
+    d_codes.append(d1)
+
+    # Stage 2
+    d2, v_res2 = pipeline_stage(v_res1, V_ref_redundant, N_comp, LSB_sub,
+                                sub_adc_params[1], ra_params[1])
+    v_res2 = np.clip(v_res2, 0, VFS)
+    d_codes.append(d2)
+
+    # Stage 3 (last stage — no RA needed, just sub-ADC)
+    d3 = sub_adc(v_res2, V_ref_redundant, N_comp, **sub_adc_params[2])
+    d_codes.append(d3)
+
+    # Digital error correction with redundancy:
+    # Each stage produces 3 bits but only 2 are "effective".
+    # Shift stage 1 by 4 bits, stage 2 by 2 bits, add stage 3.
+    # Then truncate to 7 bits. The overlap (redundancy) corrects
+    # sub-ADC offset errors via simple addition and carry.
+    d_combined = d_codes[0] * 16 + d_codes[1] * 4 + d_codes[2]
+    # Cap at 7-bit max (127)
+    d_combined = np.clip(d_combined, 0, 127)
+
+    return d_combined, d_codes
+
+
+def pipelined_adc_no_redundancy(v_in,
+                                sub_adc_params=None,
+                                ra_params=None):
+    """
+    3-stage pipelined ADC, 2 bits/stage, NO redundancy.
+    Each stage: 2-bit sub-ADC (3 comparators), gain = 4.
+    Total: 3 × 2 = 6 bits (64 levels).
+    """
+    if sub_adc_params is None:
+        sub_adc_params = [{}, {}, {}]
+    if ra_params is None:
+        ra_params = [{}, {}, {}]
+
+    lsb_nr = VFS / 4   # 2-bit LSB
+
+    # Stage 1
+    d1 = sub_adc(v_in, V_ref_no_redundancy, N_comp_nr, **sub_adc_params[0])
+    v_dac1 = sub_dac(d1, lsb_nr)
+    v_res1 = residue_amplifier(v_in - v_dac1, **ra_params[0])
+    v_res1 = np.clip(v_res1, 0, VFS)
+
+    # Stage 2
+    d2 = sub_adc(v_res1, V_ref_no_redundancy, N_comp_nr, **sub_adc_params[1])
+    v_dac2 = sub_dac(d2, lsb_nr)
+    v_res2 = residue_amplifier(v_res1 - v_dac2, **ra_params[1])
+    v_res2 = np.clip(v_res2, 0, VFS)
+
+    # Stage 3
+    d3 = sub_adc(v_res2, V_ref_no_redundancy, N_comp_nr, **sub_adc_params[2])
+
+    # No error correction — just concatenate: 2+2+2 = 6 bits
+    d_combined = d1 * 16 + d2 * 4 + d3
+    d_combined = np.clip(d_combined, 0, 63)
+
+    return d_combined
+
+
+# ═════════════════════════════════════════════
+# PART (a): Architecture
+# ═════════════════════════════════════════════
+print("=" * 60)
+print("SECTION 4: 3-Stage Pipelined ADC")
+print("=" * 60)
+print()
+print("  Part (a): Architecture")
+print("  With redundancy (2.5 bits/stage):")
+print("    - Raw bits per stage: 3")
+print("    - Effective bits per stage: 2 (1-bit overlap for error correction)")
+print("    - Total effective bits: 2 + 2 + 3 = 7 bits (last stage keeps all 3)")
+print("    - Output levels: 128")
+print()
+print("  Without redundancy (2 bits/stage):")
+print("    - Bits per stage: 2")
+print("    - Total bits: 2 + 2 + 2 = 6 bits")
+print("    - Output levels: 64")
+print()
+
+
+# ═════════════════════════════════════════════
+# PART (b): Ramp Input — Transfer Function
+# ═════════════════════════════════════════════
+N_sweep = 10000
+v_sweep = np.linspace(0, VFS, N_sweep)
+
+d_out_ramp, _ = pipelined_adc_redundant(v_sweep)
+
+# Reconstruct analog for the 7-bit pipeline
+N_total_bits = 7
+LSB_total = VFS / (2**N_total_bits)
+
+plt.figure(figsize=(10, 5))
+plt.plot(v_sweep, d_out_ramp, 'b-', linewidth=1)
+plt.xlabel("Input Voltage (V)")
+plt.ylabel("Digital Output Code")
+plt.title("Part (b): 3-Stage Pipelined ADC Transfer Function (with redundancy)")
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+
+# ═════════════════════════════════════════════
+# PART (c): Single-Tone PSD, SNDR, ENOB
+# ═════════════════════════════════════════════
+A_sig     = VFS / 2
+v_in_tone = A_sig * np.cos(2 * np.pi * Fin * t) + VFS / 2   # [0, VFS]
+
+d_out_tone, _ = pipelined_adc_redundant(v_in_tone)
+v_out_tone    = d_out_tone * LSB_total + LSB_total / 2
+v_out_ac      = v_out_tone - np.mean(v_out_tone)
+
+sndr_c, enob_c, psd_c = compute_sndr_enob(v_out_ac, signal_bin=C)
+psd_c_db = 10 * np.log10(psd_c + 1e-30)
+
+fig, axes = plt.subplots(2, 1, figsize=(10, 8))
+
+N_show = 200
+axes[0].plot(t[:N_show] * 1e9, v_in_tone[:N_show], 'b-', linewidth=1, label='Input')
+axes[0].step(t[:N_show] * 1e9, v_out_tone[:N_show], 'r-', linewidth=1, label='Pipeline Output', where='mid')
+axes[0].set_xlabel("Time (ns)")
+axes[0].set_ylabel("Voltage (V)")
+axes[0].set_title("Part (c): Input and Pipeline ADC Output Waveforms")
+axes[0].legend()
+axes[0].grid(True)
+
+axes[1].plot(f / 1e6, psd_c_db, 'b-', linewidth=0.8)
+axes[1].set_xlabel("Frequency (MHz)")
+axes[1].set_ylabel("PSD (dB/Hz)")
+axes[1].set_title(f"Part (c): PSD — SNDR = {sndr_c:.2f} dB, ENOB = {enob_c:.2f} bits")
+axes[1].grid(True)
+axes[1].set_xlim([0, Fs / 2 / 1e6])
+
+plt.tight_layout()
+plt.show()
+
+print(f"  Part (c): SNDR = {sndr_c:.2f} dB, ENOB = {enob_c:.2f} bits")
+print(f"  Ideal SNDR for 7-bit = {6.02*7 + 1.76:.2f} dB")
+print()
+
+
+# ═════════════════════════════════════════════
+# PART (d): Parameter Sweeps — WITH Redundancy
+# ═════════════════════════════════════════════
+# Sweep table from the lab handout:
+# 1. 1st stage sub-ADC offset:       -0.4*VFS to 0.4*VFS
+# 2. 2nd stage sub-ADC gain error:    0 to 0.05
+# 3. 3rd stage sub-ADC alpha2:       -0.05/VFS^2 to 0.05/VFS^2
+# 4. 1st stage RA gain error:         0 to 0.05
+# 5. 2nd stage RA offset:            -0.4*VFS to 0.4*VFS
+# 6. 2nd stage RA alpha3:            -0.05/VFS^3 to 0.05/VFS^3
+
+N_sweep_pts = 30  # Points per sweep
+
+sweep_configs = [
+    {
+        'label': '1st stage sub-ADC Offset (V_offset)',
+        'param_range': np.linspace(-0.4 * VFS, 0.4 * VFS, N_sweep_pts),
+        'xlabel': 'V_offset / VFS',
+        'x_scale': 1 / VFS,
+        'apply': lambda val: (
+            [{'offsets': val * np.ones(N_comp)}, {}, {}],  # sub_adc_params
+            [{}, {}, {}]                                    # ra_params
+        )
+    },
+    {
+        'label': '2nd stage sub-ADC Gain Error (ε)',
+        'param_range': np.linspace(0, 0.05, N_sweep_pts),
+        'xlabel': 'ε',
+        'x_scale': 1.0,
+        'apply': lambda val: (
+            [{}, {'gain_errs': val * np.ones(N_comp)}, {}],
+            [{}, {}, {}]
+        )
+    },
+    {
+        'label': '3rd stage sub-ADC α₂',
+        'param_range': np.linspace(-0.05 / VFS**2, 0.05 / VFS**2, N_sweep_pts),
+        'xlabel': 'α₂ × VFS²',
+        'x_scale': VFS**2,
+        'apply': lambda val: (
+            [{}, {}, {'alpha2s': val * np.ones(N_comp)}],
+            [{}, {}, {}]
+        )
+    },
+    {
+        'label': '1st stage RA Gain Error (ε)',
+        'param_range': np.linspace(0, 0.05, N_sweep_pts),
+        'xlabel': 'ε',
+        'x_scale': 1.0,
+        'apply': lambda val: (
+            [{}, {}, {}],
+            [{'epsilon': val}, {}, {}]
+        )
+    },
+    {
+        'label': '2nd stage RA Offset (V_offset)',
+        'param_range': np.linspace(-0.4 * VFS, 0.4 * VFS, N_sweep_pts),
+        'xlabel': 'V_offset / VFS',
+        'x_scale': 1 / VFS,
+        'apply': lambda val: (
+            [{}, {}, {}],
+            [{}, {'v_offset': val}, {}]
+        )
+    },
+    {
+        'label': '2nd stage RA α₃',
+        'param_range': np.linspace(-0.05 / VFS**3, 0.05 / VFS**3, N_sweep_pts),
+        'xlabel': 'α₃ × VFS³',
+        'x_scale': VFS**3,
+        'apply': lambda val: (
+            [{}, {}, {}],
+            [{}, {'alpha3': val}, {}]
+        )
+    },
+]
+
+
+def run_sweep_redundant(config):
+    """Run SNDR sweep for the pipelined ADC WITH redundancy."""
+    sndr_arr = np.zeros(len(config['param_range']))
+    for i, val in enumerate(config['param_range']):
+        sub_p, ra_p = config['apply'](val)
+        d_out, _ = pipelined_adc_redundant(v_in_tone,
+                                           sub_adc_params=sub_p,
+                                           ra_params=ra_p)
+        v_out = d_out * LSB_total + LSB_total / 2
+        v_out_ac = v_out - np.mean(v_out)
+        sndr_arr[i], _, _ = compute_sndr_enob(v_out_ac, signal_bin=C)
+    return sndr_arr
+
+
+def run_sweep_no_redundancy(config):
+    """Run SNDR sweep for the pipelined ADC WITHOUT redundancy."""
+    lsb_nr = VFS / (2**6)  # 6-bit total
+    sndr_arr = np.zeros(len(config['param_range']))
+
+    for i, val in enumerate(config['param_range']):
+        sub_p, ra_p = config['apply'](val)
+        # Adjust sub_adc_params for 3 comparators (no redundancy)
+        sub_p_nr = []
+        for sp in sub_p:
+            sp_nr = {}
+            for key, v in sp.items():
+                if isinstance(v, np.ndarray) and len(v) == N_comp:
+                    # Truncate to 3 comparators
+                    sp_nr[key] = v[:N_comp_nr]
+                else:
+                    sp_nr[key] = v
+            sub_p_nr.append(sp_nr)
+
+        d_out = pipelined_adc_no_redundancy(v_in_tone,
+                                            sub_adc_params=sub_p_nr,
+                                            ra_params=ra_p)
+        v_out = d_out * lsb_nr + lsb_nr / 2
+        v_out_ac = v_out - np.mean(v_out)
+        sndr_arr[i], _, _ = compute_sndr_enob(v_out_ac, signal_bin=C)
+    return sndr_arr
+
+
+print("=" * 60)
+print("PART (d): Parameter Sweeps — WITH Redundancy")
+print("=" * 60)
+
+fig_d, axes_d = plt.subplots(3, 2, figsize=(14, 12))
+axes_flat = axes_d.flatten()
+
+sndr_results_redundant = []
+for idx, config in enumerate(sweep_configs):
+    sndr_arr = run_sweep_redundant(config)
+    sndr_results_redundant.append(sndr_arr)
+
+    ax = axes_flat[idx]
+    x_vals = config['param_range'] * config['x_scale']
+    ax.plot(x_vals, sndr_arr, 'b-o', markersize=3, linewidth=1.5)
+    ax.set_xlabel(config['xlabel'])
+    ax.set_ylabel("SNDR (dB)")
+    ax.set_title(f"#{idx+1}: {config['label']}")
+    ax.grid(True, alpha=0.3)
+    ax.axhline(y=sndr_c, color='r', linestyle='--', alpha=0.5, linewidth=0.8)
+
+plt.suptitle("Part (d): SNDR vs. Parameters — WITH Redundancy", fontsize=13)
+plt.tight_layout()
+plt.show()
+
+
+# ═════════════════════════════════════════════
+# PART (e): Same Sweeps — WITHOUT Redundancy + Comparison
+# ═════════════════════════════════════════════
+print("=" * 60)
+print("PART (e): Parameter Sweeps — WITHOUT Redundancy")
+print("=" * 60)
+
+fig_e, axes_e = plt.subplots(3, 2, figsize=(14, 12))
+axes_flat_e = axes_e.flatten()
+
+for idx, config in enumerate(sweep_configs):
+    sndr_nr = run_sweep_no_redundancy(config)
+    sndr_r  = sndr_results_redundant[idx]
+
+    ax = axes_flat_e[idx]
+    x_vals = config['param_range'] * config['x_scale']
+    ax.plot(x_vals, sndr_r,  'b-o', markersize=3, linewidth=1.5, label='With Redundancy')
+    ax.plot(x_vals, sndr_nr, 'r-s', markersize=3, linewidth=1.5, label='Without Redundancy')
+    ax.set_xlabel(config['xlabel'])
+    ax.set_ylabel("SNDR (dB)")
+    ax.set_title(f"#{idx+1}: {config['label']}")
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=8)
+
+plt.suptitle("Part (e): SNDR Comparison — Redundancy vs. No Redundancy", fontsize=13)
+plt.tight_layout()
+plt.show()
+
+print()
+print("  Analysis — Which non-idealities does redundancy mitigate?")
+print("  ──────────────────────────────────────────────────────────")
+print("  ✓ Sub-ADC offset (#1): Redundancy CORRECTS offset errors.")
+print("    The overlapping decision regions allow digital error")
+print("    correction to absorb shifted thresholds. SNDR degrades")
+print("    much less with redundancy than without.")
+print()
+print("  ✗ Sub-ADC gain error (#2) and nonlinearity (#3):")
+print("    Redundancy provides LIMITED improvement. These errors")
+print("    distort the thermometer code in ways that the simple")
+print("    addition-based correction cannot fully fix.")
+print()
+print("  ✗ RA gain error (#4), offset (#5), nonlinearity (#6):")
+print("    Redundancy CANNOT correct these. RA errors occur AFTER")
+print("    the sub-ADC and corrupt the residue signal that feeds")
+print("    subsequent stages. These must be addressed by analog")
+print("    calibration or digital post-correction.")
+print()
+
+
+# ═════════════════════════════════════════════
+# PART (f): Convexity Analysis
+# ═════════════════════════════════════════════
+print("=" * 60)
+print("PART (f): Convexity Analysis")
+print("=" * 60)
+print()
+print("  The SNDR maximization problem is NON-CONVEX.")
+print()
+print("  Justification:")
+print("  1. The SNDR-vs-offset curves (#1, #5) show a plateau near zero")
+print("     with sharp drops at large offsets — this is NOT a quadratic bowl.")
+print("  2. Sub-ADC offset interacts with RA gain error: the combined effect")
+print("     is not simply additive. The loss surface has local optima and")
+print("     saddle points when multiple parameters vary simultaneously.")
+print("  3. Nonlinearity parameters (α2, α3) create harmonic distortion that")
+print("     interacts with the fundamental in a signal-dependent way,")
+print("     making the objective non-smooth in the parameter space.")
+print("  4. The digital error correction introduces discrete (non-differentiable)")
+print("     boundaries that create non-smooth regions in the SNDR landscape.")
+print()
+print("  Calibration Approach:")
+print("  ┌─────────────────────────────────────────────────────────┐")
+print("  │  Pipeline ADC Output (raw digital codes)               │")
+print("  │         │                                               │")
+print("  │         ▼                                               │")
+print("  │  ┌─────────────────┐                                    │")
+print("  │  │ Digital Error    │ ← Corrects sub-ADC offsets        │")
+print("  │  │ Correction       │   (addition + carry with          │")
+print("  │  │ (Redundancy)    │    overlapping bits)               │")
+print("  │  └────────┬────────┘                                    │")
+print("  │           ▼                                             │")
+print("  │  ┌─────────────────┐                                    │")
+print("  │  │ Gain Calibration │ ← Estimates & corrects ε per     │")
+print("  │  │                  │   stage (foreground or LMS-based) │")
+print("  │  └────────┬────────┘                                    │")
+print("  │           ▼                                             │")
+print("  │  ┌─────────────────┐                                    │")
+print("  │  │ Offset Removal   │ ← Removes RA V_offset via        │")
+print("  │  │                  │   DC estimation + subtraction     │")
+print("  │  └────────┬────────┘                                    │")
+print("  │           ▼                                             │")
+print("  │  ┌─────────────────┐                                    │")
+print("  │  │ Nonlinearity     │ ← Estimates α2, α3 coefficients  │")
+print("  │  │ Correction       │   (polynomial inverse or LUT)    │")
+print("  │  └────────┬────────┘                                    │")
+print("  │           ▼                                             │")
+print("  │     Calibrated D_out                                    │")
+print("  └─────────────────────────────────────────────────────────┘")
