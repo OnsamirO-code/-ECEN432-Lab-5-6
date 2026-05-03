@@ -1,0 +1,149 @@
+# ECEN 432 - Lab 5, Section 2
+# 2.5-bit Multiplying Digital-to-Analog Converter (MDAC)
+# Jun | Texas A&M University
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ─────────────────────────────────────────────
+# Global Parameters (same as Section 1)
+# ─────────────────────────────────────────────
+VFS    = 1.0       # Full-scale voltage (V)
+N_comp = 6         # Number of comparators (2.5-bit flash with redundancy)
+LSB    = VFS / 8   # LSB for 3-bit digital output
+G      = 4         # Interstage gain = 2^(bits_per_stage) = 2^2 = 4
+
+# Reference levels for the 2.5-bit sub-ADC (same as Section 1)
+V_ref = np.array([VFS * (i + 1) / 8 for i in range(N_comp)])
+
+
+# ═════════════════════════════════════════════
+# HELPER FUNCTIONS
+# ═════════════════════════════════════════════
+
+def flash_adc_25bit(v_in):
+    """
+    Ideal 2.5-bit flash ADC (from Section 1).
+    Returns digital code 0–7.
+    """
+    therm = np.zeros((N_comp, len(v_in)))
+    for i in range(N_comp):
+        therm[i] = (v_in > V_ref[i]).astype(int)
+    d_out = np.minimum(np.sum(therm, axis=0), 7).astype(int)
+    return d_out
+
+
+def dac_25bit(d_code):
+    """
+    Ideal 2.5-bit DAC.
+    Converts digital code (0–7) back to analog voltage.
+    DAC output = code * LSB + LSB/2  (midpoint reconstruction)
+
+    Note: For the MDAC residue computation, the DAC reconstructs
+    the sub-ADC's estimate of the input. Using midpoints ensures
+    the residue is centered around zero for each code.
+    """
+    return d_code * LSB + LSB / 2
+
+
+def mdac_25bit(v_in):
+    """
+    Ideal 2.5-bit MDAC.
+
+    Operation:
+      1. Sub-ADC quantizes input → digital code D
+      2. Internal DAC reconstructs D → V_dac
+      3. Residue = G * (V_in - V_dac)
+
+    The residue output should ideally be a sawtooth waveform
+    ranging from -G*LSB/2 to +G*LSB/2 within each code,
+    and the overall transfer characteristic should be piecewise
+    linear with no discontinuities (linear across all codes).
+    """
+    d_code = flash_adc_25bit(v_in)
+    v_dac  = dac_25bit(d_code)
+    v_res  = G * (v_in - v_dac)
+    return v_res, d_code, v_dac
+
+
+# ═════════════════════════════════════════════
+# PART (a) & (b): MDAC Transfer Characteristic
+# ═════════════════════════════════════════════
+N_sweep = 10000
+v_sweep = np.linspace(0, VFS, N_sweep)
+
+v_res, d_code, v_dac = mdac_25bit(v_sweep)
+
+# --- Print summary ---
+print("=" * 60)
+print("SECTION 2: 2.5-bit MDAC")
+print("=" * 60)
+print(f"  Full-scale voltage VFS = {VFS} V")
+print(f"  Interstage gain G      = {G}")
+print(f"  LSB                    = {LSB:.4f} V")
+print(f"  Residue range          = [{np.min(v_res):.4f}, {np.max(v_res):.4f}] V")
+print(f"  Expected residue range = [{-G*LSB/2:.4f}, {G*LSB/2:.4f}] V")
+print()
+
+# Verify linearity: check residue at a few points
+print("  Sample MDAC outputs:")
+print(f"  {'Vin (V)':>10s}  {'Code':>5s}  {'V_DAC (V)':>10s}  {'V_res (V)':>10s}")
+print(f"  {'-'*10}  {'-'*5}  {'-'*10}  {'-'*10}")
+sample_pts = [0.05, 0.15, 0.25, 0.35, 0.50, 0.65, 0.80, 0.95]
+for sv in sample_pts:
+    idx = np.argmin(np.abs(v_sweep - sv))
+    print(f"  {v_sweep[idx]:10.4f}  {d_code[idx]:5d}  {v_dac[idx]:10.4f}  {v_res[idx]:10.4f}")
+print()
+
+# --- Plot transfer characteristic ---
+fig, axes = plt.subplots(2, 1, figsize=(10, 8))
+
+# Top: MDAC residue output vs input
+axes[0].plot(v_sweep, v_res, 'b-', linewidth=1.5)
+axes[0].set_xlabel("Input Voltage (V)")
+axes[0].set_ylabel("Residue Output (V)")
+axes[0].set_title("Section 2: 2.5-bit MDAC Transfer Characteristic")
+axes[0].axhline(y=0, color='k', linewidth=0.5, linestyle='--')
+axes[0].grid(True, alpha=0.3)
+
+# Mark the code boundaries
+for vr in V_ref:
+    axes[0].axvline(x=vr, color='r', linewidth=0.5, linestyle=':', alpha=0.5)
+
+# Bottom: DAC reconstruction and sub-ADC code
+ax2 = axes[1]
+ax2.step(v_sweep, d_code, 'g-', linewidth=1.5, where='mid', label='Sub-ADC Code')
+ax2.set_xlabel("Input Voltage (V)")
+ax2.set_ylabel("Digital Code", color='g')
+ax2.tick_params(axis='y', labelcolor='g')
+ax2.set_yticks(range(8))
+ax2.grid(True, alpha=0.3)
+ax2.set_title("Sub-ADC Digital Code and DAC Reconstruction")
+
+ax2b = ax2.twinx()
+ax2b.step(v_sweep, v_dac, 'r-', linewidth=1.5, where='mid', label='DAC Output')
+ax2b.set_ylabel("DAC Output (V)", color='r')
+ax2b.tick_params(axis='y', labelcolor='r')
+
+# Combined legend
+lines1, labels1 = ax2.get_legend_handles_labels()
+lines2, labels2 = ax2b.get_legend_handles_labels()
+ax2.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
+
+plt.tight_layout()
+plt.show()
+
+# --- Linearity verification ---
+# For an ideal MDAC, the residue should be a continuous sawtooth.
+# Check that there are no jumps > G*LSB at code transitions.
+dv_res = np.diff(v_res)
+max_jump = np.max(np.abs(dv_res))
+expected_slope = G * (VFS / N_sweep)  # G * (step in v_sweep)
+
+print("  Linearity Verification:")
+print(f"    Max residue jump between adjacent samples = {max_jump:.6f} V")
+print(f"    Expected smooth step                      = {expected_slope:.6f} V")
+if max_jump < 2 * G * LSB:
+    print("    ✓ MDAC is linear — no discontinuities at code boundaries")
+else:
+    print("    ✗ Discontinuity detected — check DAC/ADC alignment")
